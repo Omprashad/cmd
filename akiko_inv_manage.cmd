@@ -21,12 +21,15 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $CFG = @{
-    WebAppUrl     = 'https://script.google.com/macros/s/AKfycbxD-r3YwRQ-BLqhExVylf1XsKVIe1wHaf6VQlzYFh6jXus224dPFn_ogTBJMui70mCPTw/exec'
-    Token         = '588a66c8-dee2-48f0-b8fe-5089fab7fee5af0063f6-7257-405c-b037-21839e31f740'
-    HomeUrl       = 'https://sites.google.com/view/akikoglobal/home'
-    InstallDir    = 'C:\ProgramData\CompanyInventory'
-    TaskName      = 'CompanyInventoryStandalone'
-    OpenHomeDaily = $true
+    WebAppUrl        = 'https://script.google.com/macros/s/AKfycbxD-r3YwRQ-BLqhExVylf1XsKVIe1wHaf6VQlzYFh6jXus224dPFn_ogTBJMui70mCPTw/exec'
+    Token            = '588a66c8-dee2-48f0-b8fe-5089fab7fee5af0063f6-7257-405c-b037-21839e31f740'
+    HomeUrl          = 'https://sites.google.com/view/akikoglobal/home'
+    InstallDir       = 'C:\ProgramData\CompanyInventory'
+    TaskName         = 'CompanyInventoryStandalone'
+    CacheDir         = Join-Path $env:LOCALAPPDATA 'CompanyInventoryStandalone'
+    RosterMaxAgeDays = 30
+    OpenHomeDaily    = $true
+    OnlineTimeoutSec = 6
 }
 
 if (-not $Mode) {
@@ -36,8 +39,7 @@ if (-not $Mode) {
 }
 $Source = if ($env:INV_SOURCE) { $env:INV_SOURCE } else { $PSCommandPath }
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if ($Mode -eq 'install' -and -not $isAdmin) { throw 'Install requires administrator privileges. Run the .cmd and approve UAC.' }
+if ($Mode -eq 'install' -and -not $isAdmin) { throw 'Install requires administrator privileges.' }
 if ($Mode -eq 'uninstall' -and -not $isAdmin) { throw 'Uninstall requires administrator privileges.' }
 
 $script:warnings = New-Object 'System.Collections.Generic.List[string]'
@@ -52,6 +54,94 @@ function Invoke-WebApi {
     return Invoke-RestMethod -Uri $CFG.WebAppUrl -Method Post -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec $Timeout -MaximumRedirection 10
 }
 
+# ===== DPAPI-backed local cache =====
+Add-Type -AssemblyName System.Security
+function Protect-Local([byte[]]$data){
+    return [System.Security.Cryptography.ProtectedData]::Protect($data, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+}
+function Unprotect-Local([byte[]]$data){
+    return [System.Security.Cryptography.ProtectedData]::Unprotect($data, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+}
+function Save-RosterCache {
+    param([string[]]$Hashes, [string]$Pepper, [string]$At)
+    New-Item -ItemType Directory -Force -Path $CFG.CacheDir | Out-Null
+    $obj = @{ version = 1; at = $At; pepper = $Pepper; hashes = $Hashes }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 4 -Compress))
+    [IO.File]::WriteAllBytes((Join-Path $CFG.CacheDir 'roster.bin'), (Protect-Local $bytes))
+}
+function Read-RosterCache {
+    $p = Join-Path $CFG.CacheDir 'roster.bin'
+    if (-not (Test-Path -LiteralPath $p)) { return $null }
+    try {
+        $bytes = Unprotect-Local ([IO.File]::ReadAllBytes($p))
+        $obj = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if (-not $obj.hashes -or -not $obj.pepper) { return $null }
+        return $obj
+    } catch { return $null }
+}
+function Get-RosterHash {
+    param([string]$Code, [string]$Dob, [string]$Pepper)
+    $h = New-Object System.Security.Cryptography.HMACSHA256
+    try {
+        $h.Key = [Text.Encoding]::UTF8.GetBytes($Pepper)
+        $b = $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($Code + '|' + $Dob))
+        return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally { $h.Dispose() }
+}
+function Save-Pending {
+    param($Payload)
+    $dir = Join-Path $CFG.CacheDir 'Pending'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $json = $Payload | ConvertTo-Json -Depth 12 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    [IO.File]::WriteAllBytes((Join-Path $dir ($Payload.eventId + '.bin')), (Protect-Local $bytes))
+}
+function Send-Pending {
+    $dir = Join-Path $CFG.CacheDir 'Pending'
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.bin' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -First 20)
+    foreach ($f in $files) {
+        try {
+            $bytes = Unprotect-Local ([IO.File]::ReadAllBytes($f.FullName))
+            $payload = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+            Send-Payload -Payload $payload | Out-Null
+            Remove-Item -LiteralPath $f.FullName -Force
+            Good ('Uploaded queued check-in: ' + $payload.eventId)
+        } catch {
+            Warn ('Queued check-in still pending: ' + $_.Exception.Message)
+            break
+        }
+    }
+}
+# ====================================
+
+function Test-Credential {
+    param([string]$Code, [string]$Dob)
+    try {
+        $r = Invoke-WebApi -Body @{action='validate'; employeeCode=$Code; dob=$Dob} -Timeout $CFG.OnlineTimeoutSec
+        if ($r.ok -ne $true) { return @{ Ok=$false; Online=$true; Message=('Server: ' + $r.error) } }
+        if ($r.valid -ne $true) { return @{ Ok=$false; Online=$true; Message='Employee ID / DOB not in the active list.' } }
+        if ($r.roster -and $r.pepper) {
+            Save-RosterCache -Hashes $r.roster -Pepper $r.pepper -At $r.rosterAt
+        }
+        return @{ Ok=$true; Online=$true; Message='' }
+    } catch {
+        $cache = Read-RosterCache
+        if (-not $cache) {
+            return @{ Ok=$false; Online=$false; Message='No network and no local cache. Connect to the internet once to activate this PC.' }
+        }
+        try {
+            $age = ([DateTime]::UtcNow - [DateTime]::Parse($cache.at)).TotalDays
+        } catch { $age = 9999 }
+        if ($age -gt $CFG.RosterMaxAgeDays) {
+            return @{ Ok=$false; Online=$false; Message=('Offline cache is ' + [math]::Round($age,0) + ' days old (limit ' + $CFG.RosterMaxAgeDays + '). Connect to the internet.') }
+        }
+        $h = Get-RosterHash -Code $Code -Dob $Dob -Pepper $cache.pepper
+        if (@($cache.hashes) -contains $h) { return @{ Ok=$true; Online=$false; Message='' } }
+        return @{ Ok=$false; Online=$false; Message='ID / DOB not in the local cache. Connect to the internet or contact IT.' }
+    }
+}
+
 function Get-ValidatedEmployeeLocked {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $xaml = @'
@@ -61,7 +151,7 @@ function Get-ValidatedEmployeeLocked {
         FocusManager.FocusedElement="{Binding ElementName=TxtCode}">
   <Grid Margin="40">
     <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
-      <TextBlock Text="AKIKO GLOBAL SERVICES LIMITED" Foreground="#7FC8F8" FontSize="42" FontWeight="Bold" HorizontalAlignment="Center"/>
+      <TextBlock Text="COMPANY SYSTEM INVENTORY" Foreground="#7FC8F8" FontSize="42" FontWeight="Bold" HorizontalAlignment="Center"/>
       <TextBlock Text="Enter your Employee ID and Date of Birth to continue. This window will not close until both are correct." Foreground="#B8D8F0" FontSize="18" Margin="0,25,0,0" TextWrapping="Wrap" MaxWidth="900" TextAlignment="Center"/>
       <TextBlock Text="EMPLOYEE ID" Foreground="#7FC8F8" FontSize="20" FontWeight="Bold" Margin="0,40,0,8" HorizontalAlignment="Center"/>
       <TextBox Name="TxtCode" FontSize="32" Width="420" Padding="12" MaxLength="40" HorizontalContentAlignment="Center" CharacterCasing="Upper"/>
@@ -100,36 +190,18 @@ function Get-ValidatedEmployeeLocked {
     })
 
     $doValidate = {
-        $Err.Foreground = '#FF6B6B'
-        $Err.Text = ''
+        $Err.Foreground = '#FF6B6B'; $Err.Text = ''
         $code = $TxtCode.Text.Trim().ToUpperInvariant()
         $dob = ($TxtDob.Text -replace '[^0-9]', '')
         if ($code -notmatch '^[A-Z0-9_-]{2,40}$') { $Err.Text = 'Employee ID format invalid.'; return }
         if ($dob -notmatch '^\d{8}$') { $Err.Text = 'DOB must be 8 digits (DDMMYYYY).'; return }
         $Ok.IsEnabled = $false; $Ok.Content = 'Validating...'
-        try {
-            $r = Invoke-WebApi -Body @{action='validate'; employeeCode=$code; dob=$dob} -Timeout 30
-            if ($r.ok -ne $true) { throw ('Server: ' + $r.error) }
-            if ($r.valid -ne $true) { $Err.Text = 'Employee ID / DOB not in the active list. Contact IT.'; return }
-            $Ok.Content = 'Collecting...'
-            $Err.Foreground = '#7FC8F8'
-            $Err.Text = 'Verified. Collecting system information...'
-            try {
-                $payload = Get-InventoryPayload -Employee $code -Dob $dob
-                Send-Payload -Payload $payload | Out-Null
-                $script:_code = $code; $script:_dob = $dob
-                $Err.Text = 'Done. Applying any pending commands...'
-                try { Invoke-PendingCommands -Uuid $payload.uuid -Employee $code -Dob $dob } catch {}
-                Start-Sleep -Milliseconds 500
-                $script:_allowClose = $true; $Timer.Stop(); $w.Close()
-            } catch {
-                $Err.Foreground = '#FF6B6B'
-                $Err.Text = 'Collection failed: ' + $_.Exception.Message
-            }
-        } catch {
-            $Err.Foreground = '#FF6B6B'
-            $Err.Text = 'Cannot validate: ' + $_.Exception.Message
-        } finally {
+        $r = Test-Credential -Code $code -Dob $dob
+        if ($r.Ok) {
+            $script:_code = $code; $script:_dob = $dob
+            $script:_allowClose = $true; $Timer.Stop(); $w.Close()
+        } else {
+            $Err.Text = $r.Message
             $Ok.IsEnabled = $true; $Ok.Content = 'Validate'
         }
     }
@@ -137,8 +209,8 @@ function Get-ValidatedEmployeeLocked {
     $TxtCode.Add_KeyDown({ param($s,$e) if ($e.Key -eq 'Return') { $TxtDob.Focus() | Out-Null } })
     $TxtDob.Add_KeyDown({ param($s,$e) if ($e.Key -eq 'Return') { & $doValidate } })
     $w.ShowDialog() | Out-Null
-    if ($CFG.OpenHomeDaily) { Open-HomePage -OncePerDay }
-    return ($script:_code -and $script:_dob)
+    if ($script:_code) { return @{ Code=$script:_code; Dob=$script:_dob } }
+    return $null
 }
 
 function Read-Cim($class) { try { @(Get-CimInstance -ClassName $class -ErrorAction Stop) } catch { $script:warnings.Add($class + ': ' + $_.Exception.Message) | Out-Null; @() } }
@@ -298,7 +370,7 @@ function Get-InventoryPayload {
 
 function Send-Payload { param($Payload) $r = Invoke-WebApi -Body $Payload -Timeout 90; if ($r.ok -ne $true) { throw ('Server: ' + $r.error) }; return $r }
 
-# ===== Command handling (wallpaper push) =====
+# ===== Wallpaper =====
 if (-not ('CompanyWallpaper' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -309,25 +381,52 @@ public static class CompanyWallpaper {
 }
 '@
 }
-
+function Normalize-ImageUrl([string]$u) {
+    if ($u -match '^https?://(www\.)?github\.com/([^/]+)/([^/]+)/blob/([^?#]+)') {
+        return "https://raw.githubusercontent.com/$($Matches[2])/$($Matches[3])/$($Matches[4])"
+    }
+    return $u
+}
+function Test-ImageMagic([byte[]]$b) {
+    if ($b.Length -lt 12) { return $false }
+    if ($b[0] -eq 0xFF -and $b[1] -eq 0xD8 -and $b[2] -eq 0xFF) { return $true }          # JPEG
+    if ($b[0] -eq 0x89 -and $b[1] -eq 0x50 -and $b[2] -eq 0x4E -and $b[3] -eq 0x47) { return $true } # PNG
+    if ($b[0] -eq 0x42 -and $b[1] -eq 0x4D) { return $true }                               # BMP
+    if ($b[0] -eq 0x47 -and $b[1] -eq 0x49 -and $b[2] -eq 0x46) { return $true }          # GIF
+    return $false
+}
 function Set-WallpaperForCurrentUser {
     param([string]$Url)
-    if ($Url -notmatch '^https://') { throw 'Wallpaper URL must start with https://' }
+    $url = Normalize-ImageUrl $Url
+    if ($url -notmatch '^https://') { throw 'Wallpaper URL must start with https://' }
+    $tmp = Join-Path $env:TEMP ('wp_' + [guid]::NewGuid().ToString('N') + '.bin')
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -TimeoutSec 60 -UserAgent 'Mozilla/5.0'
+        $bytes = [IO.File]::ReadAllBytes($tmp)
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    if (-not (Test-ImageMagic $bytes)) {
+        $preview = [Text.Encoding]::UTF8.GetString($bytes[0..([Math]::Min(200, $bytes.Length-1))])
+        throw ('URL did not return an image (first bytes: ' + ($preview -replace '\s+', ' ') + '). Use a direct image URL, not a GitHub blob page.')
+    }
     $dir = Join-Path $env:LOCALAPPDATA 'CompanyInventoryStandalone'
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $ext = [IO.Path]::GetExtension(([Uri]$Url).AbsolutePath)
+    $ext = [IO.Path]::GetExtension(([Uri]$url).AbsolutePath)
     if (-not $ext -or $ext.Length -gt 5) { $ext = '.jpg' }
     $img = Join-Path $dir ('wallpaper' + $ext)
-    Invoke-WebRequest -Uri $Url -OutFile $img -UseBasicParsing -TimeoutSec 60
+    [IO.File]::WriteAllBytes($img, $bytes)
     Add-Type -AssemblyName System.Drawing
-    $probe = [System.Drawing.Image]::FromFile($img)
-    $probe.Dispose()
-    Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'   # 10 = Fill
+    $ms = New-Object IO.MemoryStream(,$bytes)
+    try {
+        $probe = [System.Drawing.Image]::FromStream($ms)
+        $probe.Dispose()
+    } catch {
+        throw ('Downloaded file is not a decodable image: ' + $_.Exception.Message)
+    } finally { $ms.Dispose() }
+    Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
     Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper  -Value '0'
     Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper      -Value $img
-    # SPIF_UPDATEINIFILE (0x01) | SPIF_SENDWININICHANGE (0x02) = 3
     $rc = [CompanyWallpaper]::SystemParametersInfo(20, 0, $img, 3)
-    if ($rc -eq 0) { throw 'SystemParametersInfo failed' }
+    if ($rc -eq 0) { throw 'SystemParametersInfo failed (policy may block wallpaper changes)' }
 }
 
 function Invoke-PendingCommands {
@@ -357,13 +456,13 @@ function Invoke-PendingCommands {
         }
     } catch {}
 }
-# =============================================
+# ====================================
 
 function Open-HomePage {
     param([switch]$OncePerDay)
     $url = $CFG.HomeUrl; if (-not $url) { return }
     if ($OncePerDay) {
-        $flag = Join-Path $env:LOCALAPPDATA 'CompanyInventoryStandalone\lastHome.txt'
+        $flag = Join-Path $CFG.CacheDir 'lastHome.txt'
         $today = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
         if ((Test-Path $flag) -and ((Get-Content $flag -Raw).Trim() -eq $today)) { return }
         New-Item -ItemType Directory -Force -Path (Split-Path $flag) | Out-Null
@@ -382,7 +481,37 @@ function Open-HomePage {
     catch { try { Start-Process $url } catch { Warn 'Browser launch failed: ' + $url } }
 }
 
-function Invoke-CollectOnce { Get-ValidatedEmployeeLocked | Out-Null }
+function Invoke-CollectOnce {
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $result = Get-ValidatedEmployeeLocked
+        if (-not $result) { return }
+        try {
+            $payload = Get-InventoryPayload -Employee $result.Code -Dob $result.Dob
+        } catch { Warn ('Collection failed: ' + $_.Exception.Message); return }
+
+        $sent = $false
+        try {
+            Send-Payload -Payload $payload | Out-Null
+            $sent = $true
+            Good ('Inventory submitted. UUID: ' + $payload.uuid)
+        } catch {
+            if ($_.Exception.Message -match 'active list') {
+                Remove-Item -LiteralPath (Join-Path $CFG.CacheDir 'roster.bin') -Force -ErrorAction SilentlyContinue
+                Warn 'Server rejected the credential (roster changed). Cache cleared; please re-enter.'
+                continue
+            }
+            Save-Pending -Payload $payload
+            Warn ('Offline: check-in saved locally and will upload on next online logon.')
+        }
+
+        if ($sent) {
+            Send-Pending
+            try { Invoke-PendingCommands -Uuid $payload.uuid -Employee $result.Code -Dob $result.Dob } catch {}
+        }
+        if ($CFG.OpenHomeDaily) { Open-HomePage -OncePerDay }
+        return
+    }
+}
 
 function Write-AkikoCommand {
     param([string]$Dir)
@@ -422,23 +551,19 @@ function Install-Agent {
 
     $dir = $CFG.InstallDir
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-
     $cmdDest = Join-Path $dir 'CompanyInventory.cmd'
     if ((Resolve-Path -LiteralPath $self).Path -ne (Resolve-Path -LiteralPath $cmdDest -ErrorAction SilentlyContinue).Path) {
         Copy-Item -LiteralPath $self -Destination $cmdDest -Force
     }
-
     $cmdContent = [IO.File]::ReadAllText($cmdDest)
     $parts = [regex]::Split($cmdContent, '(?m)^::INVENTORY_PAYLOAD\r?\n', 2)
     if ($parts.Count -lt 2) { throw 'Marker not found in .cmd' }
     $agentPath = Join-Path $dir 'Agent.ps1'
     [IO.File]::WriteAllText($agentPath, $parts[1], [Text.UTF8Encoding]::new($false))
-
     $akikoPath = Write-AkikoCommand -Dir $dir
 
     & icacls.exe $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
     if ($LASTEXITCODE -ne 0) { Warn 'ACL restriction incomplete.' }
-
     & attrib.exe +h +s $cmdDest 2>$null
     & attrib.exe +h +s $agentPath 2>$null
     & attrib.exe +h +s $akikoPath 2>$null
@@ -454,7 +579,7 @@ function Install-Agent {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $agentPath + '" -Mode collect') -WorkingDirectory $dir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $principal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::FromMinutes(15)) -MultipleInstances IgnoreNew
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::FromMinutes(20)) -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName $CFG.TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Company inventory agent.' -Force | Out-Null
     Good 'Scheduled task registered (hidden PowerShell, runs for every user at logon).'
     Info 'Reveal command: akiko  (available in cmd after next sign-in)'
