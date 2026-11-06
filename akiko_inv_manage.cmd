@@ -151,7 +151,7 @@ function Get-ValidatedEmployeeLocked {
         FocusManager.FocusedElement="{Binding ElementName=TxtCode}">
   <Grid Margin="40">
     <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
-      <TextBlock Text="COMPANY SYSTEM INVENTORY" Foreground="#7FC8F8" FontSize="42" FontWeight="Bold" HorizontalAlignment="Center"/>
+      <TextBlock Text="AKIKO GLOBAL SERVICES LIMITED" Foreground="#7FC8F8" FontSize="42" FontWeight="Bold" HorizontalAlignment="Center"/>
       <TextBlock Text="Enter your Employee ID and Date of Birth to continue. This window will not close until both are correct." Foreground="#B8D8F0" FontSize="18" Margin="0,25,0,0" TextWrapping="Wrap" MaxWidth="900" TextAlignment="Center"/>
       <TextBlock Text="EMPLOYEE ID" Foreground="#7FC8F8" FontSize="20" FontWeight="Bold" Margin="0,40,0,8" HorizontalAlignment="Center"/>
       <TextBox Name="TxtCode" FontSize="32" Width="420" Padding="12" MaxLength="40" HorizontalContentAlignment="Center" CharacterCasing="Upper"/>
